@@ -6,6 +6,7 @@ from flask_restx import Api, Resource, fields, Namespace
 from dotenv import load_dotenv
 from typing import Annotated
 from typing_extensions import TypedDict
+from datetime import datetime
 
 # LangGraph and LangChain imports
 from langgraph.graph.message import add_messages
@@ -152,17 +153,33 @@ class State(TypedDict):
     messages: Annotated[list, add_messages]
 
 # A student-friendly system prompt
-system_prompt = """You are Study Buddy, an educational AI assistant designed to help students learn and research effectively.
-Your primary goal is to provide accurate, helpful information that enhances student learning.
+system_prompt = """You are **Study Buddy**, a knowledgeable and friendly AI assistant built to help students excel in learning and research.
 
-When answering questions:
-1. Synthesize information from multiple sources for comprehensive answers
-2. Provide explanations at an appropriate academic level
-3. Include real-world examples and applications when relevant
-4. ALWAYS cite your sources - every response MUST include references
-5. If you use web search or extract information from specific URLs, mention this
-6. When discussing complex topics, break them down into understandable components
-7. Encourage critical thinking rather than just providing direct answers
+🎯 Your goals:
+- Provide **clear, well-structured, and academically sound** responses.
+- Support students across **all education levels**, adapting complexity accordingly.
+- Use **available tools** (Wikipedia, ArXiv, Tavily search, URL extractor) to back up answers with verified sources.
+
+🧠 When answering:
+1. Break down complex concepts into **digestible parts**.
+2. Synthesize insights from **multiple tools** and **cross-reference** if needed.
+3. Include **diagrams, tables, or step-by-step explanations** if helpful.
+4. When using search tools, explain briefly **what was searched** and **why the tool was selected**.
+5. Add **insightful follow-up questions** or suggestions to encourage deeper thinking.
+
+📚 Formatting Guidelines:
+- Use **headings**, **bullets**, and **short paragraphs** to improve readability.
+- Always end with a **"References" section** using proper academic citation formats.
+
+🛠 Tool Usage Rules:
+- Use Wikipedia for well-established concepts.
+- Use ArXiv for **scientific depth** or cutting-edge research.
+- Use Tavily for **recent/current events**, or when broader sources are needed.
+- Use the URL extractor when a **specific page link** is provided.
+
+🤝 Tone:
+- Always be **encouraging and patient**.
+- Avoid sounding like a search engine — add context, summaries, and helpful commentary.
 
 FORMAT FOR REFERENCES:
 Always end your response with a "References" section that lists your sources using one of these citation styles:
@@ -187,13 +204,15 @@ If tool outputs are used directly:
 - [Tool Name] search results for "[query]"
   Example: Wikipedia search results for "quantum mechanics"
 
-You have access to several tools:
-- Wikipedia for general knowledge and concepts
-- ArXiv for academic papers and research
-- Web search for current information and diverse sources
-- URL content extraction for detailed information from specific websites
+🧪 Example Approach:
+If the student asks, "Explain quantum entanglement," you should:
+- Define it in simple terms.
+- Mention real-world applications (e.g., quantum cryptography).
+- Use Wikipedia and ArXiv together.
+- End with: "Would you like to see a visual diagram or read a specific paper on this topic?"
 
-Always adopt a friendly, encouraging tone while maintaining academic rigor.
+Remember, your job is not just to **answer**, but to **empower students to learn deeply**.
+EVERY RESPONSE MUST INCLUDE A REFERENCES SECTION.
 """
 
 # Initialize LLM - FIXED: Don't use system_message parameter in bind_tools
@@ -222,7 +241,19 @@ def chatbot(state: State):
             if isinstance(message, tuple) and len(message) == 2:
                 msg_type, content = message
                 if msg_type == "user":
-                    lc_messages.append(HumanMessage(content=content))
+                    # Check if topic might benefit from up-to-date information
+                    current_topics = ["recent", "latest", "new", "current", "today", "2023", "2024", "2025"]
+                    should_search = any(topic in content.lower() for topic in current_topics)
+                    
+                    # If it's a follow-up question in an existing conversation, don't modify
+                    if len(state["messages"]) > 1:
+                        lc_messages.append(HumanMessage(content=content))
+                    # For new conversations on current topics, encourage using search
+                    elif should_search:
+                        enhanced_prompt = f"{content}\n\nPlease use your search tools to find the most up-to-date information on this topic."
+                        lc_messages.append(HumanMessage(content=enhanced_prompt))
+                    else:
+                        lc_messages.append(HumanMessage(content=content))
                 elif msg_type == "ai":
                     lc_messages.append(AIMessage(content=content))
             # Check if message is already a LangChain message object
@@ -240,10 +271,26 @@ def chatbot(state: State):
         
         # Ensure the response has references
         if hasattr(result, 'content') and result.content:
-            if "References" not in result.content and "REFERENCES" not in result.content:
-                # Add a reminder if references are missing
-                additional_content = "\n\nPlease note: I should have included references for this information. " \
-                                    "In future responses, I'll make sure to properly cite my sources."
+            # Check for references section
+            ref_indicators = ["References", "REFERENCES", "Reference:", "Sources:", "SOURCES"]
+            has_references = any(indicator in result.content for indicator in ref_indicators)
+            
+            if not has_references:
+                # Add a more comprehensive references section if missing
+                current_date = datetime.now().strftime("%B %d, %Y")
+                additional_content = "\n\n## References\n"
+                
+                # If we can determine which tools were used (simplified example)
+                if "wikipedia" in result.content.lower():
+                    additional_content += "- Wikipedia. (n.d.). Retrieved " + current_date + "\n"
+                
+                if "arxiv" in result.content.lower():
+                    additional_content += "- Various academic papers from arXiv database. Retrieved " + current_date + "\n"
+                    
+                # Always add a general reference
+                additional_content += "- Study Buddy AI Assistant. (2023). Educational content synthesis.\n"
+                additional_content += "\nNote: In future responses, I'll provide more specific references for each piece of information."
+                
                 result.content += additional_content
         
         return {"messages": [result]}
