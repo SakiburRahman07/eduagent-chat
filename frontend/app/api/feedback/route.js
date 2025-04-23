@@ -4,23 +4,24 @@ export async function POST(request) {
   try {
     const body = await request.json();
     
-    // Forward the request to the Flask backend
-    const response = await fetch("http://localhost:5000/api/chat", {
+    // Forward the feedback to the Flask backend
+    const response = await fetch("http://localhost:5000/api/feedback", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        message: body.message,
         conversation_id: body.conversation_id,
-        context: body.context || {}  // Include context if provided
+        message_id: body.message_id,
+        rating: body.rating,
+        feedback_text: body.feedback_text || ""
       }),
     });
 
     if (!response.ok) {
-      console.error(`Backend error: ${response.status} ${response.statusText}`);
+      console.error(`Backend feedback error: ${response.status} ${response.statusText}`);
       const errorText = await response.text();
-      console.error(`Error details: ${errorText}`);
+      console.error(`Feedback error details: ${errorText}`);
       throw new Error(`Backend responded with status: ${response.status}`);
     }
 
@@ -28,9 +29,9 @@ export async function POST(request) {
     
     return NextResponse.json(data);
   } catch (error) {
-    console.error("Error forwarding request to backend:", error);
+    console.error("Error forwarding feedback to backend:", error);
     return NextResponse.json(
-      { error: "Failed to communicate with the AI service" },
+      { error: "Failed to submit feedback" },
       { status: 500 }
     );
   }

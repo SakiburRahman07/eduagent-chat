@@ -15,6 +15,36 @@ This project implements an educational AI assistant using LangGraph for the back
 - **Conversation History**: Preserves context throughout the learning session
 - **User-Friendly Interface**: Modern, responsive design with dark mode support
 
+## New Features
+
+### Enhanced Learning Experience
+- **Personalized Learning**: The AI adapts to your academic level, interests, and preferred learning style
+- **Smart Tool Selection**: Automatically uses the most appropriate knowledge sources for your questions
+- **Academic Citations**: All responses include properly formatted academic citations in APA style
+- **Feedback System**: Rate responses to help the AI improve over time
+
+### Windows PowerShell Scripts
+
+For Windows users, we've added PowerShell scripts to make starting the application easier:
+
+1. **Start everything at once**:
+```
+.\start.ps1
+```
+This will open two PowerShell windows, one for the backend and one for the frontend.
+
+2. **Start just the backend**:
+```
+.\backend\start.ps1
+```
+
+3. **Start just the frontend**:
+```
+.\frontend\start.ps1
+```
+
+These scripts solve the issue with the `&&` operator that doesn't work in Windows PowerShell.
+
 ## Requirements
 
 - Python 3.8+
