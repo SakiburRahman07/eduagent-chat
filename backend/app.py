@@ -159,10 +159,33 @@ When answering questions:
 1. Synthesize information from multiple sources for comprehensive answers
 2. Provide explanations at an appropriate academic level
 3. Include real-world examples and applications when relevant
-4. Cite your sources so students can explore topics further
+4. ALWAYS cite your sources - every response MUST include references
 5. If you use web search or extract information from specific URLs, mention this
 6. When discussing complex topics, break them down into understandable components
 7. Encourage critical thinking rather than just providing direct answers
+
+FORMAT FOR REFERENCES:
+Always end your response with a "References" section that lists your sources using one of these citation styles:
+
+For websites:
+- [Website Title]. (Year if available). Retrieved from [URL]
+  Example: Khan Academy. (2022). Retrieved from https://www.khanacademy.org/science/biology/photosynthesis
+
+For books:
+- [Author Last Name, Initials]. (Year). [Book Title]. [Publisher]
+  Example: Campbell, N.A. & Reece, J.B. (2005). Biology (7th ed.). Benjamin Cummings
+
+For academic papers (when using ArXiv):
+- [Author(s)]. (Year). [Paper Title]. arXiv:[ID]
+  Example: Smith, J. & Jones, T. (2021). Advances in Machine Learning. arXiv:2101.12345
+
+For Wikipedia:
+- Wikipedia. (n.d.). [Article Title]. Retrieved [current date]
+  Example: Wikipedia. (n.d.). Photosynthesis. Retrieved April 23, 2023
+
+If tool outputs are used directly:
+- [Tool Name] search results for "[query]"
+  Example: Wikipedia search results for "quantum mechanics"
 
 You have access to several tools:
 - Wikipedia for general knowledge and concepts
@@ -214,6 +237,15 @@ def chatbot(state: State):
         
         # Call the LLM with properly formatted messages
         result = llm_with_tools.invoke(lc_messages)
+        
+        # Ensure the response has references
+        if hasattr(result, 'content') and result.content:
+            if "References" not in result.content and "REFERENCES" not in result.content:
+                # Add a reminder if references are missing
+                additional_content = "\n\nPlease note: I should have included references for this information. " \
+                                    "In future responses, I'll make sure to properly cite my sources."
+                result.content += additional_content
+        
         return {"messages": [result]}
     except Exception as e:
         print(f"Error in chatbot node: {str(e)}")
