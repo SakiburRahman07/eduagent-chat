@@ -6,9 +6,12 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_restx import Api, Resource, fields, Namespace
 from dotenv import load_dotenv
-from typing import Annotated, List, Dict, Any
+from typing import Annotated, List, Dict, Any, Optional, Tuple
 from typing_extensions import TypedDict
 from datetime import datetime
+import json
+from collections import Counter
+import numpy as np
 
 # LangGraph and LangChain imports
 from langgraph.graph.message import add_messages
@@ -21,6 +24,23 @@ from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langchain.memory import ConversationBufferMemory
 from langchain_core.prompts import MessagesPlaceholder
 
+# Try to import sentence transformers for semantic search
+try:
+    from sentence_transformers import SentenceTransformer
+    sentence_transformers_available = True
+    # Initialize the embedding model
+    try:
+        embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+        print("Sentence transformers initialized successfully for semantic memory search.")
+    except Exception as e:
+        print(f"Error initializing sentence transformer model: {str(e)}")
+        embedding_model = None
+        sentence_transformers_available = False
+except ImportError:
+    print("Sentence transformers not available. Semantic search will be disabled.")
+    embedding_model = None
+    sentence_transformers_available = False
+
 # Import Tavily Search
 try:
     from langchain_community.tools.tavily_search import TavilySearchResults
@@ -32,6 +52,471 @@ except ImportError:
 
 # Load environment variables
 load_dotenv()
+
+# Hierarchical Memory System inspired by MemGPT
+class MemoryPage:
+    """A page of memory containing conversation exchanges and metadata"""
+    def __init__(self, content, metadata=None):
+        self.content = content
+        self.metadata = metadata or {}
+        self.created_at = datetime.now()
+        self.last_accessed = datetime.now()
+        self.access_count = 0
+        
+    def access(self):
+        """Mark this page as accessed, updating metadata"""
+        self.last_accessed = datetime.now()
+        self.access_count += 1
+        return self
+
+    def to_dict(self):
+        """Convert to dictionary for serialization"""
+        return {
+            "content": self.content,
+            "metadata": self.metadata,
+            "created_at": self.created_at.isoformat(),
+            "last_accessed": self.last_accessed.isoformat(),
+            "access_count": self.access_count
+        }
+    
+    @classmethod
+    def from_dict(cls, data):
+        """Create from dictionary (deserialization)"""
+        page = cls(data["content"], data["metadata"])
+        page.created_at = datetime.fromisoformat(data["created_at"])
+        page.last_accessed = datetime.fromisoformat(data["last_accessed"])
+        page.access_count = data["access_count"]
+        return page
+
+class HierarchicalMemory:
+    """MemGPT-inspired hierarchical memory system with main memory and external storage"""
+    def __init__(self, config=None):
+        # Configuration
+        self.config = {
+            "main_memory_capacity": 10,  # Number of exchanges to keep in immediate context
+            "attention_sink_size": 2,     # Number of important memories to always include
+            "recency_weight": 0.6,        # Weight for recency in scoring (vs relevance)
+            "relevance_threshold": 0.3,   # Minimum relevance score to retrieve
+        }
+        if config:
+            self.config.update(config)
+            
+        # Memory structures
+        self.main_memory = []               # Short-term/working memory (token context window)
+        self.external_memory = {}           # Long-term storage by topic
+        self.attention_sinks = []           # Critical memories that should always be accessible
+        self.user_profile = {}              # Persistent information about the user
+        self.embeddings_cache = {}          # Cache for computed embeddings
+        
+        # Statistics
+        self.stats = {
+            "total_exchanges": 0,
+            "pages": 0,
+            "retrievals": 0,
+            "page_ins": 0,
+            "page_outs": 0
+        }
+    
+    def add_exchange(self, user_message: str, ai_message: str, user_metadata: Dict = None, ai_metadata: Dict = None):
+        """Add a new conversation exchange to memory"""
+        # Create memory pages for user and AI messages
+        user_page = MemoryPage(
+            content=user_message,
+            metadata={
+                "type": "user_message",
+                "timestamp": datetime.now().isoformat(),
+                **(user_metadata or {})
+            }
+        )
+        
+        ai_page = MemoryPage(
+            content=ai_message,
+            metadata={
+                "type": "ai_message",
+                "timestamp": datetime.now().isoformat(),
+                **(ai_metadata or {})
+            }
+        )
+        
+        # Add to main memory
+        self.main_memory.append((user_page, ai_page))
+        
+        # Check if we need to page out to external memory
+        if len(self.main_memory) > self.config["main_memory_capacity"]:
+            self._page_out()
+            
+        # Update memory statistics
+        self.stats["total_exchanges"] += 1
+        
+        # Extract and update user profile information
+        self._update_user_profile(user_message, user_metadata)
+        
+        return len(self.main_memory)
+    
+    def _page_out(self):
+        """Move oldest memory from main memory to external memory"""
+        # Remove oldest exchange from main memory (except attention sinks)
+        oldest_exchange = self.main_memory.pop(0)
+        user_page, ai_page = oldest_exchange
+        
+        # Extract topics for memory organization
+        topics = self._extract_topics(user_page.content)
+        
+        # Store in external memory under each topic
+        for topic in topics:
+            if topic not in self.external_memory:
+                self.external_memory[topic] = []
+            self.external_memory[topic].append(oldest_exchange)
+        
+        # Update statistics
+        self.stats["pages"] += 1
+        self.stats["page_outs"] += 1
+        
+        # Check if this exchange should be an attention sink
+        self._check_attention_sink_candidate(oldest_exchange)
+    
+    def _check_attention_sink_candidate(self, exchange):
+        """Evaluate if an exchange should become an attention sink"""
+        user_page, ai_page = exchange
+        
+        # Criteria for attention sinks:
+        # 1. Message contains personal information about student
+        # 2. Message defines learning goals or preferences
+        # 3. Message contains important context for the tutoring relationship
+        
+        important_keywords = [
+            "my name is", "i am", "i'm", "my goal", "my learning", 
+            "i want to", "i need to", "i prefer", "my background",
+            "my major", "my field", "remember this", "important"
+        ]
+        
+        is_important = any(keyword in user_page.content.lower() for keyword in important_keywords)
+        
+        if is_important:
+            # Only keep top N attention sinks
+            self.attention_sinks.append(exchange)
+            if len(self.attention_sinks) > self.config["attention_sink_size"]:
+                self.attention_sinks.pop(0)  # Remove oldest attention sink
+    
+    def _update_user_profile(self, message, metadata=None):
+        """Extract and update information about the user"""
+        # This would be more sophisticated in production
+        # Simple extraction of education level
+        education_patterns = [
+            (r"i'?m in (elementary|middle|high) school", "education_level"),
+            (r"i'?m a (freshman|sophomore|junior|senior|college|university|graduate|phd) student", "education_level"),
+            (r"i'?m studying ([a-zA-Z\s]+) at ([a-zA-Z\s]+)", "field_of_study"),
+            (r"i want to learn about ([a-zA-Z\s]+)", "learning_interests"),
+            (r"i'?m interested in ([a-zA-Z\s]+)", "interests"),
+            (r"my name is ([a-zA-Z\s]+)", "name"),
+            (r"call me ([a-zA-Z\s]+)", "name")
+        ]
+        
+        # Extract information using patterns
+        message_lower = message.lower()
+        for pattern, key in education_patterns:
+            match = re.search(pattern, message_lower)
+            if match:
+                # For capturing specific fields identified in the patterns
+                if key in ["field_of_study", "learning_interests", "interests"]:
+                    if key not in self.user_profile:
+                        self.user_profile[key] = []
+                    # Add to list, avoiding duplicates
+                    value = match.group(1).strip()
+                    if value not in self.user_profile[key]:
+                        self.user_profile[key].append(value)
+                else:
+                    # For single-value fields
+                    self.user_profile[key] = match.group(1).strip()
+        
+        # Update from metadata if provided
+        if metadata:
+            for key, value in metadata.items():
+                if key.startswith("user_"):  # Only store user-related metadata
+                    profile_key = key[5:]  # Remove 'user_' prefix
+                    self.user_profile[profile_key] = value
+    
+    def _extract_topics(self, message):
+        """Extract topic keywords from a message for memory organization"""
+        # Core academic subjects
+        academic_subjects = [
+            "math", "mathematics", "algebra", "calculus", "geometry", "statistics",
+            "physics", "chemistry", "biology", "anatomy", "ecology", "genetics",
+            "history", "geography", "civics", "political science", "economics",
+            "literature", "writing", "grammar", "language", "linguistics",
+            "computer science", "programming", "coding", "algorithms",
+            "psychology", "sociology", "anthropology", "philosophy",
+            "art", "music", "theater", "film", "design"
+        ]
+        
+        # Find matches in the message
+        message_lower = message.lower()
+        found_topics = []
+        
+        # Match core academic subjects
+        for subject in academic_subjects:
+            if subject in message_lower:
+                found_topics.append(subject)
+        
+        # If no specific topics found, use general categories
+        if not found_topics:
+            # Try to categorize into general areas
+            if any(term in message_lower for term in ["math", "equation", "number", "calculation"]):
+                found_topics.append("mathematics")
+            elif any(term in message_lower for term in ["science", "experiment", "theory", "natural"]):
+                found_topics.append("science")
+            elif any(term in message_lower for term in ["history", "past", "century", "ancient", "war", "civilization"]):
+                found_topics.append("history")
+            elif any(term in message_lower for term in ["book", "novel", "story", "author", "write", "essay"]):
+                found_topics.append("literature")
+            else:
+                found_topics.append("general")
+        
+        return found_topics
+    
+    def retrieve_relevant_context(self, query, limit=3):
+        """Retrieve relevant context from memory using semantic search"""
+        # Start with attention sinks (always included)
+        relevant_exchanges = []
+        
+        # Add attention sinks
+        attention_content = []
+        for exchange in self.attention_sinks:
+            user_page, ai_page = exchange
+            attention_content.append(f"Attention Sink - Student: {user_page.content}")
+            attention_content.append(f"Attention Sink - Response: {ai_page.content}")
+        
+        # Compute query embedding for semantic search
+        query_embedding = self._get_embedding(query)
+        
+        # Search in main memory first
+        from_main = self._search_memory_segment(query, query_embedding, self.main_memory)
+        
+        # Then search in external memory
+        from_external = []
+        query_topics = self._extract_topics(query)
+        
+        # Collect all potentially relevant exchanges from external memory
+        candidate_exchanges = []
+        for topic in query_topics:
+            if topic in self.external_memory:
+                candidate_exchanges.extend(self.external_memory[topic])
+        
+        if candidate_exchanges:
+            from_external = self._search_memory_segment(query, query_embedding, candidate_exchanges)
+        
+        # Combine results - first attention sinks, then main memory, then external
+        combined = []
+        
+        # Add attention sink content
+        if attention_content:
+            combined.append("\n## Important Context\n" + "\n".join(attention_content))
+        
+        # Format and add main memory exchanges
+        if from_main:
+            main_content = [f"## Recent Conversation\n"]
+            for score, exchange in from_main[:limit]:
+                user_page, ai_page = exchange
+                main_content.append(f"Student: {user_page.content}")
+                main_content.append(f"Study Buddy: {ai_page.content[:200]}...")
+            combined.append("\n".join(main_content))
+        
+        # Format and add external memory exchanges
+        if from_external:
+            external_content = [f"## Related Previous Exchanges\n"]
+            for score, exchange in from_external[:limit]:
+                user_page, ai_page = exchange
+                external_content.append(f"Student previously asked: {user_page.content}")
+                external_content.append(f"You answered: {ai_page.content[:200]}...")
+            combined.append("\n".join(external_content))
+        
+        # Update statistics
+        self.stats["retrievals"] += 1
+        
+        return "\n\n".join(combined)
+    
+    def _search_memory_segment(self, query, query_embedding, memory_segment):
+        """Search within a specific memory segment using semantic similarity"""
+        if not memory_segment:
+            return []
+            
+        scored_exchanges = []
+        
+        # If embeddings are available, use semantic search
+        if query_embedding is not None and embedding_model is not None:
+            for exchange in memory_segment:
+                user_page, _ = exchange
+                
+                # Get or compute embedding for this exchange
+                page_embedding = self._get_embedding(user_page.content)
+                
+                if page_embedding is not None:
+                    # Compute semantic similarity
+                    similarity = np.dot(query_embedding, page_embedding)
+                    
+                    # Skip if below relevance threshold
+                    if similarity < self.config["relevance_threshold"]:
+                        continue
+                    
+                    # Calculate recency score (normalized by time decay)
+                    time_diff = (datetime.now() - user_page.last_accessed).total_seconds() / 3600  # hours
+                    recency_score = 1.0 / (1.0 + time_diff/24)  # decay over days
+                    
+                    # Combined score (weighted sum of similarity and recency)
+                    combined_score = (1-self.config["recency_weight"]) * similarity + self.config["recency_weight"] * recency_score
+                    
+                    scored_exchanges.append((combined_score, exchange))
+        else:
+            # Fallback to keyword matching if embeddings unavailable
+            keywords = self._extract_keywords(query)
+            
+            for exchange in memory_segment:
+                user_page, _ = exchange
+                
+                # Count keyword matches
+                match_count = sum(1 for kw in keywords if kw in user_page.content.lower())
+                if match_count == 0:
+                    continue
+                    
+                # Normalize by total keywords
+                similarity = match_count / len(keywords) if keywords else 0
+                
+                # Calculate recency score
+                time_diff = (datetime.now() - user_page.last_accessed).total_seconds() / 3600
+                recency_score = 1.0 / (1.0 + time_diff/24)
+                
+                # Combined score
+                combined_score = (1-self.config["recency_weight"]) * similarity + self.config["recency_weight"] * recency_score
+                
+                scored_exchanges.append((combined_score, exchange))
+        
+        # Sort by score (descending)
+        scored_exchanges.sort(reverse=True, key=lambda x: x[0])
+        
+        # Mark accessed pages
+        for _, exchange in scored_exchanges:
+            user_page, ai_page = exchange
+            user_page.access()
+            ai_page.access()
+        
+        return scored_exchanges
+    
+    def _get_embedding(self, text):
+        """Get embedding for text, using cache to avoid recomputation"""
+        if not embedding_model or not sentence_transformers_available:
+            return None
+            
+        # Simple cache key - in production would use a hashing function
+        cache_key = text[:100]  # First 100 chars as key
+        
+        if cache_key in self.embeddings_cache:
+            return self.embeddings_cache[cache_key]
+            
+        try:
+            embedding = embedding_model.encode(text, convert_to_numpy=True, normalize_embeddings=True)
+            self.embeddings_cache[cache_key] = embedding
+            return embedding
+        except Exception as e:
+            print(f"Error generating embedding: {str(e)}")
+            return None
+    
+    def _extract_keywords(self, text):
+        """Extract keywords from text for basic relevance matching"""
+        # Remove common stopwords
+        stopwords = {"a", "an", "the", "and", "or", "but", "is", "are", "in", "to", "for", "with", "on", "at"}
+        words = re.findall(r'\b\w+\b', text.lower())
+        keywords = [word for word in words if word not in stopwords and len(word) > 2]
+        return keywords
+    
+    def get_memory_summary(self):
+        """Generate a summary of memory state and user profile"""
+        summary = []
+        
+        # User profile summary
+        if self.user_profile:
+            summary.append("## Student Profile")
+            for key, value in self.user_profile.items():
+                if isinstance(value, list):
+                    summary.append(f"- {key.replace('_', ' ').title()}: {', '.join(value)}")
+                else:
+                    summary.append(f"- {key.replace('_', ' ').title()}: {value}")
+        
+        # Memory statistics
+        summary.append("## Memory Statistics")
+        summary.append(f"- Current session exchanges: {len(self.main_memory)}")
+        summary.append(f"- Total knowledge areas: {len(self.external_memory)}")
+        summary.append(f"- Total stored exchanges: {self.stats['total_exchanges']}")
+        
+        # Topics with stored knowledge
+        if self.external_memory:
+            topics = list(self.external_memory.keys())
+            topics_str = ", ".join(topics[:5])
+            if len(topics) > 5:
+                topics_str += f" and {len(topics) - 5} more"
+            summary.append(f"- Knowledge areas: {topics_str}")
+        
+        return "\n".join(summary)
+    
+    def save_to_file(self, filepath):
+        """Serialize memory to file"""
+        memory_data = {
+            "main_memory": [
+                (user.to_dict(), ai.to_dict())
+                for user, ai in self.main_memory
+            ],
+            "external_memory": {
+                topic: [
+                    (user.to_dict(), ai.to_dict())
+                    for user, ai in exchanges
+                ]
+                for topic, exchanges in self.external_memory.items()
+            },
+            "attention_sinks": [
+                (user.to_dict(), ai.to_dict())
+                for user, ai in self.attention_sinks
+            ],
+            "user_profile": self.user_profile,
+            "stats": self.stats,
+            "config": self.config
+        }
+        
+        with open(filepath, 'w') as f:
+            json.dump(memory_data, f)
+    
+    @classmethod
+    def load_from_file(cls, filepath):
+        """Load memory from serialized file"""
+        with open(filepath, 'r') as f:
+            data = json.load(f)
+        
+        memory = cls(config=data.get("config"))
+        
+        # Restore main memory
+        memory.main_memory = [
+            (MemoryPage.from_dict(user), MemoryPage.from_dict(ai))
+            for user, ai in data.get("main_memory", [])
+        ]
+        
+        # Restore external memory
+        memory.external_memory = {
+            topic: [
+                (MemoryPage.from_dict(user), MemoryPage.from_dict(ai))
+                for user, ai in exchanges
+            ]
+            for topic, exchanges in data.get("external_memory", {}).items()
+        }
+        
+        # Restore attention sinks
+        memory.attention_sinks = [
+            (MemoryPage.from_dict(user), MemoryPage.from_dict(ai))
+            for user, ai in data.get("attention_sinks", [])
+        ]
+        
+        # Restore user profile and stats
+        memory.user_profile = data.get("user_profile", {})
+        memory.stats = data.get("stats", {})
+        
+        return memory
 
 app = Flask(__name__)
 # Configure CORS to allow requests from any origin
@@ -173,6 +658,14 @@ conversations = {}
 conversation_contexts = {}
 conversation_memories = {}
 
+# Initialize hierarchical memory system
+hierarchical_memories = {}
+
+# Define memory serialization directory
+MEMORY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "memory_store")
+# Create directory if it doesn't exist
+os.makedirs(MEMORY_DIR, exist_ok=True)
+
 # Create a simple memory summarization function since we don't have ConversationSummaryMemory
 def summarize_conversation(messages, max_length=500):
     """Create a simple summary of the conversation"""
@@ -299,9 +792,10 @@ except Exception as e:
 # Define the chatbot node function
 def chatbot(state: State):
     try:
-        # Get context and memory
+        # Get context and memory information
         context = state.get("context", {})
-        memory_summary = state.get("memory", "")
+        memory_content = state.get("memory", "")
+        memory_summary = state.get("memory_summary", "")
         
         # Initialize reasoning steps
         reasoning_steps = []
@@ -318,6 +812,13 @@ def chatbot(state: State):
                         "type": "thought",
                         "content": "I need to understand the user's query and determine the best approach to answer it."
                     })
+                    
+                    # Check if we have relevant memory content
+                    if memory_content:
+                        reasoning_steps.append({
+                            "type": "memory",
+                            "content": "Retrieving relevant context from hierarchical memory system"
+                        })
                     
                     # Check if this is a STEM query that should be optimized
                     stem_focus = context.get("stem_focus", False)
@@ -367,6 +868,14 @@ def chatbot(state: State):
         # Build a dynamic system prompt that includes context and memory
         dynamic_system_prompt = system_prompt
         
+        # Add memory content if available - this includes retrieved context from hierarchical memory
+        if memory_content:
+            dynamic_system_prompt += f"\n\n{memory_content}\n"
+            
+        # Add memory summary if available - this includes statistics from the memory system
+        if memory_summary:
+            dynamic_system_prompt += f"\n\nMEMORY SUMMARY:\n{memory_summary}\n"
+        
         # Add context information if available
         if context:
             context_info = "\n\nCONVERSATION CONTEXT:\n"
@@ -394,12 +903,25 @@ def chatbot(state: State):
                     "type": "thought",
                     "content": "Using simpler explanations based on user preference"
                 })
+            if "self_consistency_applied" in context and context["self_consistency_applied"]:
+                context_info += f"- NOTE: Using self-consistency verification for enhanced accuracy.\n"
+                reasoning_steps.append({
+                    "type": "thought",
+                    "content": "Applying self-consistency checks for greater reliability"
+                })
             
             dynamic_system_prompt += context_info
         
-        # Add memory summary if available
-        if memory_summary:
-            dynamic_system_prompt += f"\n\nCONVERSATION HISTORY SUMMARY:\n{memory_summary}\n"
+        # Add specific instructions for memory utilization
+        memory_instructions = """
+MEMORY UTILIZATION INSTRUCTIONS:
+1. The MEMORY SUMMARY section contains information about the student that has been automatically extracted.
+2. The "Important Context" and "Related Previous Exchanges" sections contain relevant information from past conversations.
+3. Use this information to personalize your response and maintain continuity in the tutoring relationship.
+4. If the student refers to something from a previous conversation, try to connect it with the information provided.
+5. If you need additional information that isn't in memory, you can use your search tools.
+"""
+        dynamic_system_prompt += memory_instructions
         
         # Add system message at the beginning
         system_message = SystemMessage(content=dynamic_system_prompt)
@@ -434,6 +956,7 @@ def chatbot(state: State):
             "messages": state["messages"] + [result],
             "context": state.get("context", {}),
             "memory": state.get("memory", ""),
+            "memory_summary": state.get("memory_summary", ""),
             "reasoning": validated_reasoning
         }
     except Exception as e:
@@ -444,6 +967,7 @@ def chatbot(state: State):
             "messages": state["messages"] + [error_message],
             "context": state.get("context", {}),
             "memory": state.get("memory", ""),
+            "memory_summary": state.get("memory_summary", ""),
             "reasoning": [{"type": "error", "content": str(e)}]
         }
 
@@ -561,6 +1085,7 @@ def tool_router(state):
                 "messages": state.get("messages", []),
                 "context": state.get("context", {}),
                 "memory": state.get("memory", ""),
+                "memory_summary": state.get("memory_summary", ""),
                 "reasoning": state.get("reasoning", [])
             }
             
@@ -585,6 +1110,7 @@ def tool_router(state):
             "messages": state.get("messages", []),
             "context": state.get("context", {}),
             "memory": state.get("memory", ""),
+            "memory_summary": state.get("memory_summary", ""),
             "reasoning": state.get("reasoning", [])
         }
     except Exception as e:
@@ -595,6 +1121,7 @@ def tool_router(state):
             "messages": state.get("messages", []),
             "context": state.get("context", {}),
             "memory": state.get("memory", ""),
+            "memory_summary": state.get("memory_summary", ""),
             "reasoning": [{"type": "error", "content": str(e)}]
         }
 
@@ -686,7 +1213,6 @@ def apply_self_consistency(query, llm_instance, max_iterations=3):
         # If we have multiple answers, find the most common one
         if len(answers) > 1:
             # Count occurrences of each answer
-            from collections import Counter
             answer_counts = Counter(answers)
             
             # Get the most common answer
@@ -748,15 +1274,44 @@ class ChatResource(Resource):
             
             print(f"Received request with message: '{user_input[:50]}...' and conversation_id: {conversation_id}")
             
-            # Get or initialize conversation history, context and memory
+            # Get or initialize hierarchical memory
+            memory_file = os.path.join(MEMORY_DIR, f"{conversation_id}.json")
+            
+            if conversation_id not in hierarchical_memories:
+                # Try to load from file first
+                if os.path.exists(memory_file):
+                    try:
+                        hierarchical_memories[conversation_id] = HierarchicalMemory.load_from_file(memory_file)
+                        print(f"Loaded memory from {memory_file}")
+                    except Exception as e:
+                        print(f"Error loading memory from {memory_file}: {str(e)}")
+                        hierarchical_memories[conversation_id] = HierarchicalMemory()
+                else:
+                    hierarchical_memories[conversation_id] = HierarchicalMemory()
+            
+            # Get memory instance
+            memory = hierarchical_memories[conversation_id]
+            
+            # Get or initialize conversation history and context
             if conversation_id not in conversations:
                 conversations[conversation_id] = []
                 conversation_contexts[conversation_id] = {}
-                conversation_memories[conversation_id] = ""
             
             # Update context with any new information
             if context_updates:
                 conversation_contexts[conversation_id].update(context_updates)
+                
+                # Also update user profile in memory with relevant context
+                user_metadata = {}
+                for key, value in context_updates.items():
+                    if key in ["academic_level", "interests", "preferred_style", "learning_goal"]:
+                        user_metadata[f"user_{key}"] = value
+                
+                if user_metadata and memory.main_memory:
+                    # Update metadata for the most recent user message
+                    recent_exchange = memory.main_memory[-1]
+                    user_page, _ = recent_exchange
+                    user_page.metadata.update(user_metadata)
             
             # Process user input for topic categorization and context enrichment
             context = conversation_contexts[conversation_id]
@@ -791,17 +1346,19 @@ class ChatResource(Resource):
                     context["self_consistency_applied"] = True
                     context["consistency_score"] = consistency_result["consistency_score"]
             
+            # Get relevant context from hierarchical memory
+            relevant_context = memory.retrieve_relevant_context(user_input)
+            memory_summary = memory.get_memory_summary()
+            
             # Add user message to history
             conversations[conversation_id].append(("user", user_input))
-            
-            # Update memory with conversation summary using our custom function
-            conversation_memories[conversation_id] = summarize_conversation(conversations[conversation_id])
             
             # Prepare state with messages, context and memory
             state = {
                 "messages": conversations[conversation_id],
                 "context": conversation_contexts[conversation_id],
-                "memory": conversation_memories[conversation_id],
+                "memory": relevant_context,       # Retrieved relevant context
+                "memory_summary": memory_summary, # Memory system summary
                 "reasoning": []
             }
             
@@ -843,6 +1400,21 @@ class ChatResource(Resource):
                 })
             
             print(f"Sending response: '{response[:50]}...'")
+            
+            # Add the exchange to hierarchical memory
+            memory.add_exchange(
+                user_message=user_input,
+                ai_message=response,
+                user_metadata=context
+            )
+            
+            # Save memory to file periodically (every 3 exchanges)
+            if memory.stats["total_exchanges"] % 3 == 0:
+                try:
+                    memory.save_to_file(memory_file)
+                    print(f"Saved memory to {memory_file}")
+                except Exception as e:
+                    print(f"Error saving memory to {memory_file}: {str(e)}")
             
             # Generate a unique message ID for feedback purposes
             message_id = str(uuid.uuid4())
@@ -1110,6 +1682,62 @@ class FeedbackResource(Resource):
         except Exception as e:
             print(f"Error processing feedback: {str(e)}")
             return {"message": "Error processing feedback"}, 500
+
+# Add a memory statistics endpoint
+memory_stats_model = api.model('MemoryStats', {
+    'conversation_id': fields.String(required=True, description='Conversation identifier')
+})
+
+memory_stats_response = api.model('MemoryStatsResponse', {
+    'stats': fields.Raw(description='Memory statistics'),
+    'user_profile': fields.Raw(description='User profile information'),
+    'topics': fields.List(fields.String(description='Knowledge topics')),
+    'main_memory_size': fields.Integer(description='Number of exchanges in main memory'),
+    'external_memory_size': fields.Integer(description='Number of exchanges in external memory'),
+    'attention_sinks': fields.Integer(description='Number of attention sink memories')
+})
+
+@chat_ns.route('/memory_stats')
+class MemoryStatsResource(Resource):
+    @chat_ns.expect(memory_stats_model)
+    @chat_ns.marshal_with(memory_stats_response)
+    @chat_ns.doc(
+        responses={
+            200: "Success",
+            404: "Conversation not found",
+            500: "Server error"
+        },
+        description="Get memory statistics for a conversation"
+    )
+    def post(self):
+        """Get memory statistics for a conversation"""
+        try:
+            data = request.json
+            conversation_id = data.get('conversation_id')
+            
+            if not conversation_id:
+                return {"message": "Missing conversation_id parameter"}, 400
+                
+            if conversation_id not in hierarchical_memories:
+                return {"message": "Memory not found for conversation"}, 404
+                
+            memory = hierarchical_memories[conversation_id]
+            
+            # Count total exchanges in external memory
+            external_count = sum(len(exchanges) for exchanges in memory.external_memory.values())
+            
+            return {
+                'stats': memory.stats,
+                'user_profile': memory.user_profile,
+                'topics': list(memory.external_memory.keys()),
+                'main_memory_size': len(memory.main_memory),
+                'external_memory_size': external_count,
+                'attention_sinks': len(memory.attention_sinks)
+            }
+            
+        except Exception as e:
+            print(f"Error retrieving memory stats: {str(e)}")
+            return {"message": "Error retrieving memory statistics"}, 500
 
 if __name__ == '__main__':
     print("Starting Study Buddy AI Assistant...")
