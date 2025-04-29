@@ -11,6 +11,6 @@ flask-cors==4.0.0
 flask-restx==1.1.0
 werkzeug==2.0.3
 python-dotenv==1.0.0
-sentence-transformers==2.5.0
-typing-extensions>=4.5.0
-numpy>=1.24.3
+sentence-transformers
+typing-extensions
+numpy
