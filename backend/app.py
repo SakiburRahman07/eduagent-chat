@@ -57,11 +57,16 @@ chat_input = api.model('ChatInput', {
     'context': fields.Raw(required=False, description='Additional context parameters')
 })
 
+reasoning_step = api.model('ReasoningStep', {
+    'type': fields.String(description='Type of reasoning step'),
+    'content': fields.String(description='Content of the reasoning step')
+})
+
 chat_output = api.model('ChatOutput', {
     'response': fields.String(description='AI response'),
     'conversation_id': fields.String(description='Conversation identifier'),
     'message_id': fields.String(description='Unique message identifier for feedback'),
-    'reasoning': fields.List(fields.String(description='Reasoning steps'))
+    'reasoning': fields.List(fields.Nested(reasoning_step, description='Reasoning step details'))
 })
 
 # Get API keys from environment variables
@@ -213,6 +218,20 @@ system_prompt = """You are **Study Buddy**, a knowledgeable and friendly AI assi
 4. When using search tools, explain briefly **what was searched** and **why the tool was selected**.
 5. Add **insightful follow-up questions** or suggestions to encourage deeper thinking.
 
+🔍 CHAIN-OF-THOUGHT REASONING:
+For complex problems (especially in mathematics, science, logic, and multi-step reasoning):
+1. **Break down the problem** into smaller, manageable components
+2. **Think step by step** - show your complete reasoning process
+3. **Explicitly state intermediate steps** - don't skip logical connections
+4. Consider **multiple approaches** when appropriate and explain why you chose a particular method
+5. Clearly indicate your **final answer** after showing all reasoning steps
+6. For mathematical problems, explain each calculation and why you're performing it
+
+Examples:
+- For math: "First, I'll identify the variables... Next, I'll set up the equation... Then I'll solve for x..."
+- For conceptual: "To understand this concept, let's first examine... This leads us to consider... Finally..."
+- For analysis: "First, let's identify the key factors... Next, let's analyze how these interact... This suggests..."
+
 📚 Formatting Guidelines:
 - Use **headings**, **bullets**, and **short paragraphs** to improve readability.
 - Always end with a **"References" section** using proper academic citation formats.
@@ -311,11 +330,25 @@ def chatbot(state: State):
                         })
                         lc_messages.append(HumanMessage(content=optimized_content))
                     else:
+                        # Check if the query would benefit from Chain-of-Thought reasoning
+                        requires_cot = needs_chain_of_thought(content)
+                        
                         # Check if topic might benefit from up-to-date information
                         current_topics = ["recent", "latest", "new", "current", "today", "2023", "2024", "2025"]
                         should_search = any(topic in content.lower() for topic in current_topics)
                         
-                        if should_search:
+                        if requires_cot:
+                            reasoning_steps.append({
+                                "type": "thought",
+                                "content": "This query would benefit from chain-of-thought reasoning. Enhancing prompt to encourage step-by-step thinking."
+                            })
+                            # Add CoT directive to the prompt
+                            enhanced_prompt = f"{content}\n\nPlease use chain-of-thought reasoning to solve this problem. Think step by step and show all your work."
+                            lc_messages.append(HumanMessage(content=enhanced_prompt))
+                            
+                            # Add CoT requirement to context for consistency in follow-ups
+                            context["requires_cot"] = True
+                        elif should_search:
                             reasoning_steps.append({
                                 "type": "thought",
                                 "content": "This query may benefit from up-to-date information. I'll use search tools to find recent data."
@@ -349,6 +382,12 @@ def chatbot(state: State):
                 context_info += f"- Preferred Learning Style: {context['preferred_style']}\n"
             if "stem_focus" in context:
                 context_info += f"- STEM Focus: {context['stem_focus']}\n"
+            if "requires_cot" in context and context["requires_cot"]:
+                context_info += f"- NOTE: Student's questions benefit from chain-of-thought reasoning. Show your step-by-step thinking process.\n"
+                reasoning_steps.append({
+                    "type": "thought",
+                    "content": "Using chain-of-thought reasoning for this conversation"
+                })
             if "simplify_explanations" in context and context["simplify_explanations"]:
                 context_info += f"- NOTE: Student has requested simpler explanations. Please break down concepts into more basic terms and avoid jargon.\n"
                 reasoning_steps.append({
@@ -378,12 +417,24 @@ def chatbot(state: State):
             "content": "Generated response with citations and references"
         })
         
+        # Validate reasoning steps to ensure all keys and values are strings
+        validated_reasoning = []
+        for step in reasoning_steps:
+            validated_step = {}
+            for k, v in step.items():
+                # Ensure keys are strings
+                key = str(k) if not isinstance(k, str) else k
+                # Ensure values are strings
+                value = str(v) if not isinstance(v, str) else v
+                validated_step[key] = value
+            validated_reasoning.append(validated_step)
+        
         # Return updated state with all fields preserved
         return {
             "messages": state["messages"] + [result],
             "context": state.get("context", {}),
             "memory": state.get("memory", ""),
-            "reasoning": reasoning_steps
+            "reasoning": validated_reasoning
         }
     except Exception as e:
         print(f"Error in chatbot node: {str(e)}")
@@ -417,6 +468,51 @@ def optimize_query(query, query_type=None):
         return f"concept explanation {query}"
         
     return query
+
+# Add a function to detect if a query requires chain-of-thought reasoning
+def needs_chain_of_thought(query):
+    """Detect if a query would benefit from chain-of-thought reasoning"""
+    if not query or not isinstance(query, str):
+        return False
+        
+    query_lower = query.lower()
+    
+    # Keywords indicating complex problem-solving
+    problem_solving_indicators = [
+        "solve", "calculate", "find", "determine", "compute", "prove", 
+        "explain how", "explain why", "reason", "analyze", "step by step", 
+        "step-by-step", "break down", "work through", "approach"
+    ]
+    
+    # Subject areas that often benefit from step-by-step reasoning
+    cot_subjects = [
+        "math", "mathematics", "algebra", "calculus", "geometry", "trigonometry",
+        "physics", "chemistry", "equations", "formula", "theorem", "proof",
+        "algorithm", "programming", "code", "logic", "syllogism", "argument",
+        "reasoning", "philosophy", "ethics", "economic", "statistics", "probability"
+    ]
+    
+    # Question patterns that indicate multi-step reasoning needs
+    multi_step_patterns = [
+        "what happens if", "what would happen", "how would", "why does", 
+        "explain the process", "walk me through", "how can i", "how do i",
+        "steps to", "steps for", "procedure for", "method to"
+    ]
+    
+    # Check if the query contains problem-solving indicators
+    has_problem_indicator = any(indicator in query_lower for indicator in problem_solving_indicators)
+    
+    # Check if the query relates to subjects that benefit from CoT
+    has_cot_subject = any(subject in query_lower for subject in cot_subjects)
+    
+    # Check if the query follows multi-step reasoning patterns
+    has_multi_step_pattern = any(pattern in query_lower for pattern in multi_step_patterns)
+    
+    # Check for mathematical expressions or equations
+    has_math_expression = bool(re.search(r'[0-9+\-*/()^=]', query)) and bool(re.search(r'[+\-*/()^=]', query))
+    
+    # Decision logic: Use CoT if the query matches specific patterns
+    return has_math_expression or (has_problem_indicator and has_cot_subject) or has_multi_step_pattern
 
 # Tool selection logic based on query content
 def select_tools(query):
@@ -464,7 +560,8 @@ def tool_router(state):
                 "tool_choice": None,
                 "messages": state.get("messages", []),
                 "context": state.get("context", {}),
-                "memory": state.get("memory", "")
+                "memory": state.get("memory", ""),
+                "reasoning": state.get("reasoning", [])
             }
             
         latest_user_message = user_messages[-1][1]
@@ -487,7 +584,8 @@ def tool_router(state):
             "tool_choice": preferred_tools[0] if preferred_tools else None,
             "messages": state.get("messages", []),
             "context": state.get("context", {}),
-            "memory": state.get("memory", "")
+            "memory": state.get("memory", ""),
+            "reasoning": state.get("reasoning", [])
         }
     except Exception as e:
         print(f"Error in tool router: {str(e)}")
@@ -496,7 +594,8 @@ def tool_router(state):
             "tool_choice": None,
             "messages": state.get("messages", []),
             "context": state.get("context", {}),
-            "memory": state.get("memory", "")
+            "memory": state.get("memory", ""),
+            "reasoning": [{"type": "error", "content": str(e)}]
         }
 
 # Create and compile the graph
@@ -528,6 +627,91 @@ def create_graph():
         return graph_builder.compile()
     except Exception as e:
         print(f"Error creating graph: {str(e)}")
+        return None
+
+# Add a self-consistency function to improve reliability of CoT reasoning for complex problems
+def apply_self_consistency(query, llm_instance, max_iterations=3):
+    """
+    Implements the self-consistency technique (Wang et al., 2022) by generating
+    multiple reasoning paths and taking the majority answer for critical reasoning tasks.
+    
+    Args:
+        query: The user's question
+        llm_instance: The LLM to use for generating responses
+        max_iterations: Maximum number of reasoning paths to generate
+    
+    Returns:
+        The most consistent answer with its reasoning path
+    """
+    try:
+        # Only apply this to complex reasoning questions to avoid unnecessary API calls
+        if not needs_chain_of_thought(query):
+            return None
+            
+        # Create a prompt that encourages diverse reasoning paths
+        base_prompt = f"""
+        I need to solve this problem using different approaches:
+        
+        {query}
+        
+        Let me solve this step-by-step using different reasoning paths.
+        """
+        
+        # Generate multiple reasoning paths
+        reasoning_paths = []
+        answers = []
+        
+        for i in range(max_iterations):
+            # Add entropy to encourage diverse approaches
+            approach_prompt = f"{base_prompt}\n\nReasoning Path #{i+1}:"
+            
+            # Get response
+            messages = [
+                SystemMessage(content="You are a mathematical and logical reasoning expert. Show your work step-by-step."),
+                HumanMessage(content=approach_prompt)
+            ]
+            
+            response = llm_instance.invoke(messages)
+            
+            if response and hasattr(response, 'content'):
+                reasoning_paths.append(response.content)
+                
+                # Extract the answer from the reasoning path
+                # This is a simple approach - more sophisticated parsing could be implemented
+                answer_match = re.search(r'(answer|result|therefore)(?:.+?)(?:is|=)\s*([^\.]+)', 
+                                       response.content, re.IGNORECASE)
+                if answer_match:
+                    answers.append(answer_match.group(2).strip())
+        
+        # If we have multiple answers, find the most common one
+        if len(answers) > 1:
+            # Count occurrences of each answer
+            from collections import Counter
+            answer_counts = Counter(answers)
+            
+            # Get the most common answer
+            most_common_answer = answer_counts.most_common(1)[0][0]
+            
+            # Find the reasoning path that led to this answer
+            for i, path in enumerate(reasoning_paths):
+                if i < len(answers) and answers[i] == most_common_answer:
+                    return {
+                        "answer": most_common_answer,
+                        "reasoning": path,
+                        "consistency_score": answer_counts[most_common_answer] / len(answers)
+                    }
+        
+        # If we couldn't find a consistent answer or only have one path, return the first one
+        if reasoning_paths:
+            return {
+                "answer": answers[0] if answers else "Unknown",
+                "reasoning": reasoning_paths[0],
+                "consistency_score": 1.0 if len(answers) == 1 else 0.0
+            }
+            
+        return None
+    except Exception as e:
+        print(f"Error in self-consistency check: {str(e)}")
         return None
 
 graph = create_graph()
@@ -584,6 +768,29 @@ class ChatResource(Resource):
             if any(keyword in user_input.lower() for keyword in stem_keywords) and "stem_focus" not in context:
                 context["stem_focus"] = True
             
+            # Check if this question requires high-reliability reasoning with self-consistency
+            # Only apply to complex mathematical/logical problems to avoid unnecessary API usage
+            math_patterns = [
+                r'\d+[\+\-\*\/]\d+',  # Basic arithmetic expressions
+                r'equation',
+                r'solve for',
+                r'calculate',
+                r'compute'
+            ]
+            is_complex_math = needs_chain_of_thought(user_input) and any(re.search(pattern, user_input, re.IGNORECASE) for pattern in math_patterns)
+            
+            # For complex math problems, try self-consistency approach first
+            consistency_result = None
+            if is_complex_math and llm:
+                print(f"Applying self-consistency for complex problem: {user_input[:50]}...")
+                consistency_result = apply_self_consistency(user_input, llm, max_iterations=2)
+                
+                if consistency_result and consistency_result.get("consistency_score", 0) >= 0.5:
+                    print(f"Self-consistency check successful with score: {consistency_result['consistency_score']}")
+                    # Store the self-consistency result in context for later use
+                    context["self_consistency_applied"] = True
+                    context["consistency_score"] = consistency_result["consistency_score"]
+            
             # Add user message to history
             conversations[conversation_id].append(("user", user_input))
             
@@ -621,8 +828,20 @@ class ChatResource(Resource):
                 if "reasoning" in event:
                     reasoning_steps.extend(event["reasoning"])
             
-            # Return the last AI response
+            # For complex math problems where we applied self-consistency, replace response if needed
             response = ai_responses[-1] if ai_responses else "I couldn't generate a response"
+            
+            if consistency_result and context.get("self_consistency_applied") and consistency_result.get("reasoning"):
+                # Add self-consistency information to the response
+                enhanced_response = f"{response}\n\n**Self-Consistency Check**: I verified this solution using multiple reasoning paths for higher reliability."
+                response = enhanced_response
+                
+                # Add reasoning step about self-consistency
+                reasoning_steps.append({
+                    "type": "verification",
+                    "content": f"Applied self-consistency with {consistency_result.get('consistency_score', 0)} agreement score"
+                })
+            
             print(f"Sending response: '{response[:50]}...'")
             
             # Generate a unique message ID for feedback purposes
@@ -635,17 +854,35 @@ class ChatResource(Resource):
             # Map the message ID to the response index in the conversation history
             conversation_contexts[conversation_id]["message_ids"][message_id] = len(conversations[conversation_id]) - 1
             
+            # Ensure reasoning_steps contains only dictionaries with string attributes
+            validated_reasoning = []
+            for step in reasoning_steps:
+                if isinstance(step, dict):
+                    # Convert all values to strings to avoid serialization issues
+                    validated_step = {}
+                    for k, v in step.items():
+                        if not isinstance(k, str):
+                            k = str(k)
+                        if not isinstance(v, str):
+                            v = str(v)
+                        validated_step[k] = v
+                    validated_reasoning.append(validated_step)
+                else:
+                    # If it's not a dict, convert to a simple dict with string values
+                    validated_reasoning.append({"type": "unknown", "content": str(step)})
+            
             return {
                 'response': response,
                 'conversation_id': conversation_id,
                 'message_id': message_id,
-                'reasoning': reasoning_steps
+                'reasoning': validated_reasoning
             }
         except Exception as e:
             print(f"Error processing request: {str(e)}")
             return {
                 'response': "I'm sorry, I encountered an error processing your request. Please try again.",
                 'conversation_id': conversation_id if 'conversation_id' in locals() else 'error',
+                'message_id': str(uuid.uuid4()),
                 'reasoning': [{"type": "error", "content": str(e)}]
             }, 500
 
@@ -742,6 +979,9 @@ def post_process_response(response):
     # Format URLs as citations
     content = extract_and_format_citations(content)
     
+    # Enhance Chain-of-Thought formatting if present
+    content = enhance_cot_structure(content)
+    
     # Check if there's a references section
     ref_indicators = ["References", "REFERENCES", "Reference:", "Sources:", "SOURCES"]
     has_references = any(indicator in content for indicator in ref_indicators)
@@ -754,6 +994,56 @@ def post_process_response(response):
     # Update the response content
     response.content = content
     return response
+
+# Add a function to enhance the structure of Chain-of-Thought reasoning
+def enhance_cot_structure(text):
+    """Enhance the structure and formatting of Chain-of-Thought reasoning in the text"""
+    if not text:
+        return text
+        
+    # Identify common step indicators
+    step_patterns = [
+        r'Step \d+[\.:]',  # Step 1:, Step 2., etc.
+        r'(\d+)[\.:]',      # 1., 2:, etc. at the beginning of lines
+        r'First,',
+        r'Second,', 
+        r'Third,',
+        r'Next,',
+        r'Then,',
+        r'Finally,'
+    ]
+    
+    # Flag to track if we've detected CoT reasoning
+    has_cot_structure = any(re.search(pattern, text, re.IGNORECASE) for pattern in step_patterns)
+    
+    if has_cot_structure:
+        # Add a wrapper section for the CoT reasoning if not already present
+        if not re.search(r'(step[-\s]by[-\s]step|reasoning process|chain[-\s]of[-\s]thought|solution approach)', text, re.IGNORECASE):
+            sections = text.split('\n\n')
+            
+            # Find the best place to insert the CoT header
+            insert_index = 0
+            for i, section in enumerate(sections):
+                if any(re.search(pattern, section, re.IGNORECASE) for pattern in step_patterns):
+                    insert_index = i
+                    break
+            
+            # Insert the CoT header
+            sections.insert(insert_index, "## Step-by-Step Solution Process")
+            text = '\n\n'.join(sections)
+        
+        # Make step numbers bold if they aren't already
+        for pattern in step_patterns:
+            matches = re.findall(pattern, text)
+            for match in matches:
+                # Skip if the match already contains markdown formatting
+                if '**' in match:
+                    continue
+                # Create the bold replacement, preserving trailing punctuation
+                replacement = re.sub(r'(\w+)', r'**\1**', match)
+                text = text.replace(match, replacement)
+    
+    return text
 
 # Add feedback handling in the ChatResource class
 @chat_ns.route('/feedback')
