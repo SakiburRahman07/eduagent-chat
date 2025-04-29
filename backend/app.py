@@ -20,9 +20,12 @@ from langgraph.prebuilt import ToolNode, tools_condition
 from langchain_community.utilities import WikipediaAPIWrapper, ArxivAPIWrapper
 from langchain_community.tools import WikipediaQueryRun, ArxivQueryRun
 from langchain_groq import ChatGroq
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, FunctionMessage
 from langchain.memory import ConversationBufferMemory
 from langchain_core.prompts import MessagesPlaceholder
+
+# Import our custom CRITIC framework
+from critic import CriticFramework
 
 # Try to import sentence transformers for semantic search
 try:
@@ -703,6 +706,7 @@ system_prompt = """You are **Study Buddy**, a knowledgeable and friendly AI assi
 - Provide **clear, well-structured, and academically sound** responses.
 - Support students across **all education levels**, adapting complexity accordingly.
 - Use **available tools** (Wikipedia, ArXiv, Tavily search, URL extractor) to back up answers with verified sources.
+- Apply the **CRITIC framework** to verify information and self-correct when necessary.
 
 🧠 When answering:
 1. Break down complex concepts into **digestible parts**.
@@ -724,6 +728,15 @@ Examples:
 - For math: "First, I'll identify the variables... Next, I'll set up the equation... Then I'll solve for x..."
 - For conceptual: "To understand this concept, let's first examine... This leads us to consider... Finally..."
 - For analysis: "First, let's identify the key factors... Next, let's analyze how these interact... This suggests..."
+
+🔬 THE CRITIC FRAMEWORK:
+When providing factual information, I follow the CRITIC framework to ensure accuracy:
+1. **Claim Identification**: I identify specific claims that need verification
+2. **Research & Information Gathering**: I use appropriate tools to verify each claim
+3. **Information Triangulation**: I cross-check information from multiple sources when possible
+4. **Truth Assessment**: I evaluate the reliability and consistency of the information
+5. **Integration & Correction**: I integrate verified information and correct any inaccuracies
+6. **Confidence Communication**: I clearly state my confidence level in the information provided
 
 📚 Formatting Guidelines:
 - Use **headings**, **bullets**, and **short paragraphs** to improve readability.
@@ -1125,12 +1138,202 @@ def tool_router(state):
             "reasoning": [{"type": "error", "content": str(e)}]
         }
 
+# Add a function to implement the CRITIC framework for tool output reflection
+def reflect_on_tool_output(state: State):
+    """
+    Implement the CRITIC framework for LLM to critique and verify information using tools.
+    
+    This function allows the agent to:
+    1. Identify potential errors or inaccuracies in tool outputs
+    2. Verify information against other sources
+    3. Determine if additional tools are needed for complete verification
+    4. Produce more accurate and transparent responses
+    
+    Args:
+        state: The current state including messages and tool outputs
+        
+    Returns:
+        Updated state with reflection results and next tool selection if needed
+    """
+    try:
+        # Initialize reasoning steps to track the reflection process
+        reasoning_steps = state.get("reasoning", [])
+        
+        # Extract the most recent user query
+        user_messages = [msg for msg in state["messages"] if isinstance(msg, tuple) and msg[0] == "user"]
+        if not user_messages:
+            reasoning_steps.append({
+                "type": "critic",
+                "content": "No user query found to reflect on"
+            })
+            return {
+                "messages": state.get("messages", []),
+                "tool_reflection": None,
+                "need_additional_tools": False,
+                "context": state.get("context", {}),
+                "memory": state.get("memory", ""),
+                "memory_summary": state.get("memory_summary", ""),
+                "reasoning": reasoning_steps
+            }
+            
+        latest_user_message = user_messages[-1][1]
+        
+        # Get the most recent tool outputs
+        tool_outputs = [msg for msg in state["messages"] if hasattr(msg, 'type') and msg.type == "function"]
+        if not tool_outputs:
+            reasoning_steps.append({
+                "type": "critic",
+                "content": "No tool outputs to reflect on"
+            })
+            return {
+                "messages": state.get("messages", []),
+                "tool_reflection": None,
+                "need_additional_tools": False,
+                "context": state.get("context", {}),
+                "memory": state.get("memory", ""),
+                "memory_summary": state.get("memory_summary", ""),
+                "reasoning": reasoning_steps
+            }
+            
+        latest_tool_output = tool_outputs[-1].content if hasattr(tool_outputs[-1], 'content') else str(tool_outputs[-1])
+        current_tool = state.get("tool_choice", "unknown_tool")
+        
+        # Add a reasoning step about starting reflection
+        reasoning_steps.append({
+            "type": "critic",
+            "content": f"Reflecting on output from {current_tool} to verify information accuracy"
+        })
+        
+        # Generate reflection prompt following CRITIC framework
+        reflection_prompt = f"""
+        # CRITIC Framework Analysis
+        
+        ## User Query
+        {latest_user_message}
+        
+        ## Tool Used
+        {current_tool}
+        
+        ## Tool Output
+        {latest_tool_output}
+        
+        Please analyze this tool output following the CRITIC framework:
+        
+        1. **Identify Claims**: What factual claims are made in this output?
+        2. **Assess Verification Needs**: Which claims require further verification?
+        3. **Identify Potential Errors**: Are there any potential inaccuracies, contradictions, or uncertainties?
+        4. **Evaluate Completeness**: Does this output fully answer the user's question?
+        5. **Tool Selection**: Would another tool provide complementary or corrective information?
+        
+        Based on your analysis:
+        - Is the information adequate and accurate? (Yes/No/Partial)
+        - Should we use another tool to verify or complement? (Yes/No)
+        - If yes, what specific tool should we use? (wikipedia/arxiv/tavily)
+        - What specific query should we use with that tool?
+        """
+        
+        # Call LLM to generate reflection
+        reflection_messages = [
+            SystemMessage(content="You are a critical thinking assistant evaluating information quality and accuracy."), 
+            HumanMessage(content=reflection_prompt)
+        ]
+        
+        # Use the same LLM that's used throughout the application
+        reflection_result = llm.invoke(reflection_messages)
+        
+        # Extract reflection content
+        reflection_text = reflection_result.content if hasattr(reflection_result, 'content') else str(reflection_result)
+        
+        # Add detailed reflection to reasoning steps
+        reasoning_steps.append({
+            "type": "critic_reflection",
+            "content": reflection_text[:300] + "..." if len(reflection_text) > 300 else reflection_text
+        })
+        
+        # Parse reflection to determine next action
+        need_more_info = "yes" in reflection_text.lower() and (
+            "should we use another tool" in reflection_text.lower() or 
+            "use another tool" in reflection_text.lower()
+        )
+        
+        # Extract recommended tool if mentioned
+        next_tool = None
+        if need_more_info:
+            # Look for tool recommendations in the reflection
+            for tool_name in ["wikipedia", "arxiv", "tavily"]:
+                if tool_name.lower() in reflection_text.lower():
+                    next_tool = tool_name
+                    break
+                    
+            # If no specific tool was recommended but verification is needed,
+            # select a tool different from the current one
+            if not next_tool:
+                available_tools = [t for t in ["wikipedia", "arxiv", "tavily"] if t != current_tool]
+                if available_tools:
+                    next_tool = available_tools[0]
+            
+            # Try to extract a specific query recommendation
+            query_match = re.search(r"query.*?[\"\'](.*?)[\"\']", reflection_text, re.IGNORECASE)
+            specific_query = query_match.group(1) if query_match else latest_user_message
+            
+            # Add reasoning step for tool selection
+            reasoning_steps.append({
+                "type": "tool_selection",
+                "content": f"Based on CRITIC analysis, using {next_tool} to verify information with query: '{specific_query}'"
+            })
+            
+            # Create a human message that will be processed by the chatbot to use the tool
+            verification_message = (
+                "user", 
+                f"[SYSTEM: VERIFICATION QUERY] {specific_query}"
+            )
+            state["messages"].append(verification_message)
+        else:
+            reasoning_steps.append({
+                "type": "conclusion",
+                "content": "Information appears sufficient and accurate; no additional verification needed"
+            })
+        
+        # Update state with reflection and action
+        return {
+            "messages": state.get("messages", []),
+            "tool_reflection": reflection_text,
+            "need_additional_tools": need_more_info,
+            "next_tool": next_tool,
+            "context": state.get("context", {}),
+            "memory": state.get("memory", ""),
+            "memory_summary": state.get("memory_summary", ""),
+            "reasoning": reasoning_steps,
+            "tool_choice": next_tool if need_more_info else None
+        }
+        
+    except Exception as e:
+        print(f"Error in CRITIC reflection: {str(e)}")
+        return {
+            "messages": state.get("messages", []),
+            "tool_reflection": f"Error during reflection: {str(e)}",
+            "need_additional_tools": False,
+            "context": state.get("context", {}),
+            "memory": state.get("memory", ""),
+            "memory_summary": state.get("memory_summary", ""),
+            "reasoning": state.get("reasoning", []) + [{"type": "error", "content": f"Error in CRITIC reflection: {str(e)}"}]
+        }
+
 # Create and compile the graph
 def create_graph():
     try:
+        # Initialize the CRITIC framework with our LLM
+        critic_framework = CriticFramework(llm)
+        
+        # Define a wrapper function to integrate with LangGraph
+        def critic_node(state):
+            return critic_framework.reflect_on_tool_output(state)
+        
+        # Build the graph
         graph_builder = StateGraph(State)
         graph_builder.add_node("chatbot", chatbot)
         graph_builder.add_node("tool_router", tool_router)
+        graph_builder.add_node("critic", critic_node)  # Add CRITIC reflection node
         
         # Create tool node with additional configuration for tool choice
         tool_node = ToolNode(
@@ -1149,7 +1352,19 @@ def create_graph():
             "chatbot",
             tools_condition
         )
-        graph_builder.add_edge("tools", "chatbot")
+        
+        # Add CRITIC framework to the workflow
+        graph_builder.add_edge("tools", "critic")
+        
+        # Conditional edge from CRITIC reflection
+        graph_builder.add_conditional_edges(
+            "critic",
+            lambda x: x.get("need_additional_tools", False),
+            {
+                True: "tool_router",  # If more info needed, route to another tool
+                False: "chatbot"      # Otherwise proceed to response
+            }
+        )
 
         return graph_builder.compile()
     except Exception as e:
@@ -1371,19 +1586,38 @@ class ChatResource(Resource):
             # Extract the AI response and reasoning steps from the last event
             ai_responses = []
             reasoning_steps = []
+            critic_verification_happened = False
+            
             for event in events:
-                # Add each message to the history
-                message = event["messages"][-1]
-                if message.type == "ai":
-                    if hasattr(message, 'content') and message.content:
-                        ai_responses.append(message.content)
+                # Add each message to the history (except internal verification queries)
+                if "messages" in event and event["messages"]:
+                    message = event["messages"][-1]
                     
-                    # Add AI message to conversation history
-                    conversations[conversation_id].append(("ai", message.content if hasattr(message, 'content') else ""))
+                    # Check if this is an AI message to add to responses
+                    if hasattr(message, 'type') and message.type == "ai":
+                        if hasattr(message, 'content') and message.content:
+                            ai_responses.append(message.content)
+                        
+                        # Add AI message to conversation history only if it's not a verification response
+                        if not critic_verification_happened:
+                            conversations[conversation_id].append(("ai", message.content if hasattr(message, 'content') else ""))
+                    
+                    # Skip adding SYSTEM verification queries to the conversation history
+                    if isinstance(message, tuple) and message[0] == "user" and "[SYSTEM: VERIFICATION QUERY]" in message[1]:
+                        critic_verification_happened = True
+                        # Add reasoning step about using CRITIC for verification
+                        reasoning_steps.append({
+                            "type": "critic",
+                            "content": f"Applying CRITIC framework to verify information using additional tool queries"
+                        })
                 
                 # Collect reasoning steps
                 if "reasoning" in event:
-                    reasoning_steps.extend(event["reasoning"])
+                    for step in event["reasoning"]:
+                        if "critic" in step.get("type", "").lower():
+                            # Mark that we've used the CRITIC framework
+                            critic_verification_happened = True
+                        reasoning_steps.append(step)
             
             # For complex math problems where we applied self-consistency, replace response if needed
             response = ai_responses[-1] if ai_responses else "I couldn't generate a response"
@@ -1398,6 +1632,15 @@ class ChatResource(Resource):
                     "type": "verification",
                     "content": f"Applied self-consistency with {consistency_result.get('consistency_score', 0)} agreement score"
                 })
+            
+            # Add explanation about CRITIC verification if applied
+            if critic_verification_happened:
+                # Add a brief explanation about the CRITIC framework being used for greater accuracy
+                critic_explanation = (
+                    "\n\n**Verification Process**: I used the CRITIC (Critique and Reflection for Information Validation) framework "
+                    "to verify the information provided and ensure accuracy."
+                )
+                response += critic_explanation
             
             print(f"Sending response: '{response[:50]}...'")
             
