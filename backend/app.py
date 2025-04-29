@@ -60,7 +60,8 @@ chat_input = api.model('ChatInput', {
 chat_output = api.model('ChatOutput', {
     'response': fields.String(description='AI response'),
     'conversation_id': fields.String(description='Conversation identifier'),
-    'message_id': fields.String(description='Unique message identifier for feedback')
+    'message_id': fields.String(description='Unique message identifier for feedback'),
+    'reasoning': fields.List(fields.String(description='Reasoning steps'))
 })
 
 # Get API keys from environment variables
@@ -159,6 +160,7 @@ class State(TypedDict):
     messages: Annotated[list, add_messages]
     context: dict  # Store persistent context like academic level, topics of interest, etc.
     memory: str    # Store conversation summary
+    reasoning: List[Dict[str, str]]  # Store reasoning steps
 
 # Initialize memory and context storage
 # In a production environment, this should be replaced with a database
@@ -264,7 +266,7 @@ try:
     # Initialize Groq model
     llm = ChatGroq(
         groq_api_key=GROQ_API_KEY, 
-        model_name="Gemma2-9b-It"
+        model_name="meta-llama/llama-4-maverick-17b-128e-instruct"
     )
     
     # Bind tools without system_message parameter
@@ -282,6 +284,9 @@ def chatbot(state: State):
         context = state.get("context", {})
         memory_summary = state.get("memory", "")
         
+        # Initialize reasoning steps
+        reasoning_steps = []
+        
         # Convert messages to proper message types with better error handling
         lc_messages = []
         for message in state["messages"]:
@@ -289,29 +294,38 @@ def chatbot(state: State):
             if isinstance(message, tuple) and len(message) == 2:
                 msg_type, content = message
                 if msg_type == "user":
+                    # Add initial reasoning step
+                    reasoning_steps.append({
+                        "type": "thought",
+                        "content": "I need to understand the user's query and determine the best approach to answer it."
+                    })
+                    
                     # Check if this is a STEM query that should be optimized
                     stem_focus = context.get("stem_focus", False)
                     if stem_focus:
                         # Try to optimize the query for STEM topics
                         optimized_content = optimize_query(content, "scientific")
+                        reasoning_steps.append({
+                            "type": "thought",
+                            "content": f"This appears to be a STEM-related query. Optimizing it for scientific accuracy: {optimized_content}"
+                        })
                         lc_messages.append(HumanMessage(content=optimized_content))
                     else:
                         # Check if topic might benefit from up-to-date information
                         current_topics = ["recent", "latest", "new", "current", "today", "2023", "2024", "2025"]
                         should_search = any(topic in content.lower() for topic in current_topics)
                         
-                        # If it's a follow-up question in an existing conversation, don't modify
-                        if len(state["messages"]) > 1:
-                            lc_messages.append(HumanMessage(content=content))
-                        # For new conversations on current topics, encourage using search
-                        elif should_search:
+                        if should_search:
+                            reasoning_steps.append({
+                                "type": "thought",
+                                "content": "This query may benefit from up-to-date information. I'll use search tools to find recent data."
+                            })
                             enhanced_prompt = f"{content}\n\nPlease use your search tools to find the most up-to-date information on this topic."
                             lc_messages.append(HumanMessage(content=enhanced_prompt))
                         else:
                             lc_messages.append(HumanMessage(content=content))
                 elif msg_type == "ai":
                     lc_messages.append(AIMessage(content=content))
-            # Check if message is already a LangChain message object
             elif hasattr(message, 'type'):
                 lc_messages.append(message)
             else:
@@ -325,6 +339,10 @@ def chatbot(state: State):
             context_info = "\n\nCONVERSATION CONTEXT:\n"
             if "academic_level" in context:
                 context_info += f"- Student Academic Level: {context['academic_level']}\n"
+                reasoning_steps.append({
+                    "type": "thought",
+                    "content": f"Adapting response for {context['academic_level']} level understanding"
+                })
             if "interests" in context:
                 context_info += f"- Topics of Interest: {', '.join(context['interests'])}\n"
             if "preferred_style" in context:
@@ -333,6 +351,10 @@ def chatbot(state: State):
                 context_info += f"- STEM Focus: {context['stem_focus']}\n"
             if "simplify_explanations" in context and context["simplify_explanations"]:
                 context_info += f"- NOTE: Student has requested simpler explanations. Please break down concepts into more basic terms and avoid jargon.\n"
+                reasoning_steps.append({
+                    "type": "thought",
+                    "content": "Using simpler explanations based on user preference"
+                })
             
             dynamic_system_prompt += context_info
         
@@ -350,35 +372,18 @@ def chatbot(state: State):
         # Post-process the response for better citations
         result = post_process_response(result)
         
-        # Ensure the response has references
-        if hasattr(result, 'content') and result.content:
-            # Check for references section
-            ref_indicators = ["References", "REFERENCES", "Reference:", "Sources:", "SOURCES"]
-            has_references = any(indicator in result.content for indicator in ref_indicators)
-            
-            if not has_references:
-                # Add a more comprehensive references section if missing
-                current_date = datetime.now().strftime("%B %d, %Y")
-                additional_content = "\n\n## References\n"
-                
-                # If we can determine which tools were used (simplified example)
-                if "wikipedia" in result.content.lower():
-                    additional_content += "- Wikipedia. (n.d.). Retrieved " + current_date + "\n"
-                
-                if "arxiv" in result.content.lower():
-                    additional_content += "- Various academic papers from arXiv database. Retrieved " + current_date + "\n"
-                    
-                # Always add a general reference
-                additional_content += "- Study Buddy AI Assistant. (2023). Educational content synthesis.\n"
-                additional_content += "\nNote: In future responses, I'll provide more specific references for each piece of information."
-                
-                result.content += additional_content
+        # Add final reasoning step
+        reasoning_steps.append({
+            "type": "action",
+            "content": "Generated response with citations and references"
+        })
         
         # Return updated state with all fields preserved
         return {
             "messages": state["messages"] + [result],
             "context": state.get("context", {}),
-            "memory": state.get("memory", "")
+            "memory": state.get("memory", ""),
+            "reasoning": reasoning_steps
         }
     except Exception as e:
         print(f"Error in chatbot node: {str(e)}")
@@ -387,7 +392,8 @@ def chatbot(state: State):
         return {
             "messages": state["messages"] + [error_message],
             "context": state.get("context", {}),
-            "memory": state.get("memory", "")
+            "memory": state.get("memory", ""),
+            "reasoning": [{"type": "error", "content": str(e)}]
         }
 
 # Add a query optimizer function to improve search queries
@@ -588,7 +594,8 @@ class ChatResource(Resource):
             state = {
                 "messages": conversations[conversation_id],
                 "context": conversation_contexts[conversation_id],
-                "memory": conversation_memories[conversation_id]
+                "memory": conversation_memories[conversation_id],
+                "reasoning": []
             }
             
             # Process with LangGraph
@@ -597,8 +604,9 @@ class ChatResource(Resource):
                 stream_mode="values"
             )
             
-            # Extract the AI response from the last event
+            # Extract the AI response and reasoning steps from the last event
             ai_responses = []
+            reasoning_steps = []
             for event in events:
                 # Add each message to the history
                 message = event["messages"][-1]
@@ -608,6 +616,10 @@ class ChatResource(Resource):
                     
                     # Add AI message to conversation history
                     conversations[conversation_id].append(("ai", message.content if hasattr(message, 'content') else ""))
+                
+                # Collect reasoning steps
+                if "reasoning" in event:
+                    reasoning_steps.extend(event["reasoning"])
             
             # Return the last AI response
             response = ai_responses[-1] if ai_responses else "I couldn't generate a response"
@@ -626,13 +638,15 @@ class ChatResource(Resource):
             return {
                 'response': response,
                 'conversation_id': conversation_id,
-                'message_id': message_id
+                'message_id': message_id,
+                'reasoning': reasoning_steps
             }
         except Exception as e:
             print(f"Error processing request: {str(e)}")
             return {
                 'response': "I'm sorry, I encountered an error processing your request. Please try again.",
-                'conversation_id': conversation_id if 'conversation_id' in locals() else 'error'
+                'conversation_id': conversation_id if 'conversation_id' in locals() else 'error',
+                'reasoning': [{"type": "error", "content": str(e)}]
             }, 500
 
 # Add a health check endpoint

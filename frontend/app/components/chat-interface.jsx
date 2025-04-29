@@ -120,13 +120,6 @@ export default function ChatInterface() {
     setIsLoading(true);
 
     try {
-      // Log the request being sent
-      console.log("Sending request:", {
-        message: currentInput,
-        conversation_id: conversationId,
-        context: userContext
-      });
-      
       // Send message to API with context
       const response = await fetch("/api/chat", {
         method: "POST",
@@ -155,7 +148,8 @@ export default function ChatInterface() {
         { 
           role: "assistant", 
           content: data.response,
-          message_id: data.message_id 
+          message_id: data.message_id,
+          reasoning: data.reasoning
         },
       ]);
     } catch (error) {
@@ -165,6 +159,7 @@ export default function ChatInterface() {
         {
           role: "assistant",
           content: "Sorry, I encountered an error. Please try again.",
+          reasoning: [{ type: "error", content: error.message }]
         },
       ]);
     } finally {
@@ -173,7 +168,7 @@ export default function ChatInterface() {
   }
 
   // Enhanced chat message component with feedback options
-  const ChatMessage = ({ message, isUser }) => {
+  const ChatMessage = ({ message, isUser, reasoning, messageId, feedbackState, onFeedback }) => {
     // Check if message content is a string or object
     const messageContent = typeof message === 'string' ? message : message.content;
     
@@ -252,7 +247,7 @@ export default function ChatInterface() {
                           variant="ghost" 
                           size="icon" 
                           className="h-6 w-6" 
-                          onClick={() => provideFeedback(message.message_id, 5)}
+                          onClick={() => onFeedback(message.message_id, 5)}
                         >
                           <ThumbsUp className="h-3 w-3" />
                         </Button>
@@ -268,7 +263,7 @@ export default function ChatInterface() {
                           variant="ghost" 
                           size="icon" 
                           className="h-6 w-6" 
-                          onClick={() => provideFeedback(message.message_id, 2)}
+                          onClick={() => onFeedback(message.message_id, 2)}
                         >
                           <ThumbsDown className="h-3 w-3" />
                         </Button>
@@ -400,8 +395,12 @@ export default function ChatInterface() {
               {messages.map((message, i) => (
                 <ChatMessage 
                   key={i} 
-                  message={message} 
-                  isUser={message.role === "user"} 
+                  message={message.content} 
+                  isUser={message.role === "user"}
+                  reasoning={message.reasoning}
+                  messageId={message.message_id}
+                  feedbackState={feedbackState}
+                  onFeedback={provideFeedback}
                 />
               ))}
               {isLoading && (
